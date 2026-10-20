@@ -1,2 +1,10 @@
-GROQ_API_KEY = "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"
-GROQ_MODEL = "openai/gpt-oss-120b"
+[theme]
+base = "dark"
+primaryColor = "#14B8A6"
+backgroundColor = "#0B1120"
+secondaryBackgroundColor = "#111827"
+textColor = "#F9FAFB"
+font = "sans serif"
+
+[server]
+headless = true
