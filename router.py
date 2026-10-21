@@ -1,3 +1,4 @@
+
 import argparse
 import json
 import re
@@ -12,7 +13,9 @@ from llm_client import (
 from sop_rag import answer_from_sop, search_sop
 
 
-Route = Literal["policy", "orders", "both", "schema", "policy+schema"]
+Route = Literal[
+    "general", "policy", "orders", "both", "schema", "policy+schema"
+]
 
 _SCHEMA_QUESTION = re.compile(
     r"\b(schema|database structure|structure of "
@@ -44,39 +47,81 @@ def classify_question(question: str) -> Route:
             {
                 "role": "system",
                 "content": (
-                    "Classify the user's request for a supply-chain assistant. "
-                    "Return exactly one label: policy, orders, both, schema, "
-                    "or policy+schema. "
-                    "Use policy for SOP/company policy/procedure questions. "
-                    "Use orders for live customer, order, or order-item database "
-                    "facts. Use schema when asked for database structure, tables, "
-                    "columns, or their types. Use policy+schema when the question "
-                    "asks for both SOP guidance and database structure. Use both "
-                    "only when answering requires both SOP information and live "
-                    "order data. If uncertain, choose both."
+                    "Classify the user's question for a supply-chain assistant. "
+                    "Return exactly one label: general, policy, orders, both, "
+                    "schema, or policy+schema.\n\n"
+                    "Rules:\n"
+                    "- general: ordinary general-knowledge questions that do "
+                    "not require the project's SOP documents or live database. "
+                    "Examples: 'What is supply chain?', 'What is logistics?', "
+                    "'Explain inventory management in simple words'.\n"
+                    "- policy: questions specifically about procedures, rules, "
+                    "or guidance in the available SOP documents.\n"
+                    "- orders: questions requiring live customer, order, or "
+                    "order-item database facts.\n"
+                    "- both: questions requiring BOTH SOP guidance and live "
+                    "order data.\n"
+                    "- schema: questions asking for internal database structure, "
+                    "tables, columns, or types.\n"
+                    "- policy+schema: questions requesting both SOP guidance "
+                    "and internal database structure.\n\n"
+                    "Do not choose orders or both unless live database facts "
+                    "are actually needed. Do not choose policy merely because "
+                    "a question mentions supply chains generally. If the "
+                    "question can be answered with general knowledge, choose "
+                    "general."
                 ),
             },
             {"role": "user", "content": question},
         ],
     )
+
     label = response.choices[0].message.content
     if not label:
         raise RuntimeError("The model returned an empty routing decision.")
 
     route = label.strip().lower()
-    routes: dict[str, Route] = {
-        "policy": "policy",
-        "orders": "orders",
-        "both": "both",
-        "schema": "schema",
-        "policy+schema": "policy+schema",
+    allowed_routes = {
+        "general", "policy", "orders", "both", "schema", "policy+schema"
     }
-    if route not in routes:
-        raise ValueError(f"Unexpected routing decision from the model: {route!r}")
-    return routes[route]
+
+    if route not in allowed_routes:
+        # Fail safely: do not send an unclear question to PostgreSQL.
+        return "general"
+
+    return route  # type: ignore[return-value]
 
 
-def _answer_with_database(question: str, rows: list[dict[str, object]]) -> str:
+def _answer_general(question: str) -> str:
+    response = get_groq_client().chat.completions.create(
+        model=get_groq_model(),
+        temperature=0.2,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a helpful supply-chain assistant. Answer general "
+                    "knowledge questions clearly and accurately, using simple "
+                    "language when appropriate. Do not query or claim to have "
+                    "queried a database or SOP documents. If the user asks for "
+                    "specific current order records, explain that those require "
+                    "the order-data workflow."
+                ),
+            },
+            {"role": "user", "content": question},
+        ],
+    )
+
+    answer = response.choices[0].message.content
+    if not answer:
+        raise RuntimeError("The model returned an empty general answer.")
+
+    return answer.strip()
+
+
+def _answer_with_database(
+    question: str, rows: list[dict[str, object]]
+) -> str:
     response = get_groq_client().chat.completions.create(
         model=get_groq_model(),
         temperature=0,
@@ -98,9 +143,11 @@ def _answer_with_database(question: str, rows: list[dict[str, object]]) -> str:
             },
         ],
     )
+
     answer = response.choices[0].message.content
     if not answer:
         raise RuntimeError("The model returned an empty database answer.")
+
     return answer_or_verification_notice(question, answer.strip(), rows)
 
 
@@ -116,6 +163,7 @@ def _answer_with_both(
         )
         for source in sources
     )
+
     response = get_groq_client().chat.completions.create(
         model=get_groq_model(),
         temperature=0,
@@ -139,9 +187,11 @@ def _answer_with_both(
             },
         ],
     )
+
     answer = response.choices[0].message.content
     if not answer:
         raise RuntimeError("The model returned an empty combined answer.")
+
     return answer_or_verification_notice(
         question,
         answer.strip(),
@@ -150,21 +200,36 @@ def _answer_with_both(
 
 
 def answer_question(question: str, top_k: int = 5) -> dict[str, Any]:
-    if not question.strip():
+    question = question.strip()
+    if not question:
         raise ValueError("Question cannot be empty.")
 
     if _is_schema_question(question):
         return {"route": "restricted", "answer": _SCHEMA_REFUSAL}
 
     route = classify_question(question)
+
     if route in {"schema", "policy+schema"}:
         return {"route": "restricted", "answer": _SCHEMA_REFUSAL}
 
+    # General questions use Groq directly, without FAISS or PostgreSQL.
+    if route == "general":
+        return {
+            "route": "general",
+            "answer": _answer_general(question),
+        }
+
+    # SOP questions use FAISS and the existing SOP answer workflow.
     if route == "policy":
         sources = search_sop(question, top_k=top_k)
         answer = answer_from_sop(question, sources)
-        return {"route": route, "answer": answer, "sources": sources}
+        return {
+            "route": "policy",
+            "answer": answer,
+            "sources": sources,
+        }
 
+    # Only order-related and combined questions reach PostgreSQL.
     try:
         sql, rows = query_database(question)
     except SQLQueryError:
@@ -172,20 +237,33 @@ def answer_question(question: str, top_k: int = 5) -> dict[str, Any]:
             "route": route,
             "answer": (
                 "I couldn't retrieve the requested order information. "
-                "Please try rephrasing your question."
+                "Please check the database connection and try again."
             ),
         }
+    except (KeyError, RuntimeError) as exc:
+        if "DATABASE_URL" in str(exc):
+            return {
+                "route": route,
+                "answer": (
+                    "Order information is unavailable because the database "
+                    "connection is not configured. General and SOP questions "
+                    "can still be answered without PostgreSQL."
+                ),
+            }
+        raise
+
     if route == "orders":
         return {
-            "route": route,
+            "route": "orders",
             "answer": _answer_with_database(question, rows),
             "sql": sql,
             "rows": rows,
         }
 
     sources = search_sop(question, top_k=top_k)
+
     return {
-        "route": route,
+        "route": "both",
         "answer": _answer_with_both(question, rows, sources),
         "sql": sql,
         "rows": rows,
@@ -195,7 +273,8 @@ def answer_question(question: str, top_k: int = 5) -> dict[str, Any]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Answer questions using SOP documents and order data."
+        description="Answer questions using general knowledge, SOP documents, "
+        "and order data."
     )
     parser.add_argument("question", help="Question to ask the assistant")
     args = parser.parse_args()
