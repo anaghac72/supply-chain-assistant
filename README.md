@@ -221,3 +221,29 @@ The application expects these tables:
 
 The full columns, types, and relationships are listed in
 [`DATABASE_SCHEMA.md`](./DATABASE_SCHEMA.md).
+
+## Live Application
+
+The Supply Chain SOP and Order Assistant is available as a Streamlit web application.
+
+**Application URL:** [Open Supply Chain Assistant](https://supply-chain-assistant-nndpvwnx4axgoypsslnat9.streamlit.app/)
+
+Users can interact with the assistant through the web interface to ask questions about WHO supply-chain SOPs, inventory management, procurement, and supported order information.
+
+### Deployment
+
+The application is deployed using Streamlit Community Cloud and connects to the project's Python modules for question routing, SOP retrieval, answer generation, and verification.
+
+- **Frontend:** Streamlit
+- **Language:** Python
+- **LLM provider:** Groq
+- **SOP retrieval:** FAISS and Sentence Transformers
+- **Order database:** PostgreSQL
+- **Deployment platform:** Streamlit Community Cloud
+
+### Configuration
+
+The deployed application requires the appropriate Groq API key and, for order-related questions, a valid PostgreSQL database connection. Credentials should be configured through Streamlit Cloud Secrets and must not be committed to the repository.
+
+SOP-only questions should work independently of PostgreSQL when the SOP index and required dependencies are available.
+
